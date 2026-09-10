@@ -2,6 +2,7 @@
 
 #include <esp_attr.h>
 #include <esp_compiler.h>
+#include <esp_idf_version.h>
 #include <soc/soc_caps.h>
 
 #define IRAM IRAM_ATTR
@@ -15,6 +16,19 @@
 
 #define MAX_N_UARTS SOC_UART_NUM
 #define MAX_N_I2C SOC_I2C_NUM
+
+// W5500 etc. via Arduino-ESP32 core 3.x ETH.h; see Machine/EthPhy.h.
+// Unlike esp32s3/Platform.h this has to be version-gated: the SPI-attached
+// Ethernet ETH.begin() overload that Machine/EthPhy.cpp calls only exists in
+// Arduino core 3.x (ESP-IDF 5.x), and the stock platform-espressif32 build of
+// plain ESP32 is still pinned to core 2.0.17 / ESP-IDF 4.4, whose ETH.h has no
+// such overload. Defining this unconditionally would stop the default esp32
+// envs from compiling. See the wifi_eth env in platformio_override.ini for a
+// plain-ESP32 build against a core 3.x platform.
+#if ESP_IDF_VERSION_MAJOR >= 5
+#    define MAX_N_ETH 1
+#endif
+
 #define MAX_N_USB_HOST 0
 #define MAX_N_DACS SOC_DAC_PERIPH_NUM
 #define MAX_N_RMT SOC_RMT_GROUPS
@@ -41,8 +55,6 @@ const int BAUD_RATE = 115200;
 #include <esp_task_wdt.h>
 
 #include "esp32-hal.h"  // disableCore0WDT
-
-#include <esp_idf_version.h>
 
 #include "Logging.h"
 
@@ -81,7 +93,21 @@ inline bool should_exit() {
     return false;
 }
 
-#define USE_ARDUINO_I2C_DRIVER 0
+// As of ESP-IDF 5.4, the Arduino core's Wire/TwoWire implementation
+// (esp32-hal-i2c-ng.c) switched to the new "driver_ng" I2C driver
+// (driver/i2c_master.h). ESP-IDF now aborts at startup if the legacy
+// driver (driver/i2c.h, used by esp32/i2c.cpp) is also installed
+// anywhere in the same firmware ("CONFLICT! driver_ng is not allowed
+// to be used with this old driver"). Route FluidNC's own I2C bus
+// through Wire (arduino_i2c_driver.cpp) so everything uses driver_ng.
+// Same rule as esp32s3/Platform.h; it only bites once plain ESP32 is
+// built against a core 3.x platform, but the OLED here lives on i2c0 so
+// getting it wrong is an immediate boot abort rather than a soft failure.
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+#    define USE_ARDUINO_I2C_DRIVER 1
+#else
+#    define USE_ARDUINO_I2C_DRIVER 0
+#endif
 
 inline BaseType_t xTaskCreateAffinitySet(TaskFunction_t      pvTaskCode,
                                          const char* const   pcName,

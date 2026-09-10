@@ -1,0 +1,13 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# 4MB ESP32, single app partition, no OTA.
+#
+# The core 3.x / IDF 5.5.4 build of the wifi variant is ~2.5MB, so it does not
+# fit either 1.875MB slot of min_littlefs.csv and two such slots cannot exist
+# on 4MB flash at all.  OTA is therefore not available for the wifi_eth env;
+# flash over USB.  The space freed by dropping the second app slot also grows
+# LocalFS from 192KB to 1.2MB, which matters here because this machine has no
+# SD card.
+nvs,      data, nvs,      0x9000,  0x5000,
+otadata,  data, ota,      0xe000,  0x2000,
+app0,     app,  factory, 0x10000,0x2C0000,
+spiffs,   data, spiffs, 0x2D0000,0x130000,

@@ -1,0 +1,62 @@
+name: build-wifi-eth
+
+# ITRI 自編韌體：plain ESP32 + W5500 乙太網路（wifi_eth env）。
+# 推這個分支或手動觸發都會編，成品放在 artifact「wifi_eth-firmware」。
+on:
+  push:
+    branches: [itri-wifi-eth]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git-version.py 用 git describe 產生版本字串，要抓得到 tag
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-wifi_eth-${{ hashFiles('platformio.ini', 'platformio_override.ini') }}
+          restore-keys: pio-${{ runner.os }}-wifi_eth-
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build wifi_eth
+        run: pio run -e wifi_eth
+
+      - name: Enforce app partition limit
+        run: |
+          SIZE=$(stat -c%s .pio/build/wifi_eth/firmware.bin)
+          LIMIT=2883584
+          echo "firmware.bin = $SIZE bytes (limit $LIMIT)"
+          # PlatformIO 的容量檢查拿整顆 flash 當上限，會漏放，所以自己核對
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            echo "::error::firmware.bin exceeds app partition ($SIZE > $LIMIT)"; exit 1
+          fi
+
+      - name: Build LocalFS image (buildfs)
+        run: pio run -e wifi_eth -t buildfs
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          cp .pio/build/wifi_eth/firmware.bin   out/
+          cp .pio/build/wifi_eth/bootloader.bin out/ || true
+          cp .pio/build/wifi_eth/partitions.bin out/ || true
+          cp .pio/build/wifi_eth/littlefs.bin   out/ || true
+          ls -la out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wifi_eth-firmware
+          path: out/
+          if-no-files-found: error

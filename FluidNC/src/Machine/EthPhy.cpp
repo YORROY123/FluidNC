@@ -69,28 +69,61 @@ namespace Machine {
         }
 
         // config->_spi holds Pin objects for the shared SPI bus (sck/mosi/miso).
-        // ETH.begin()'s SPI-Ethernet overload takes raw pin numbers and manages
-        // its own ESP-IDF spi_master device on the host we give it; it does not
-        // require config->_spi->init() to have been called first. We reuse the
-        // same physical bus pins that SDCard and other SPI peripherals use, on
-        // a separate SPI host (FSPI/SPI2) so it doesn't fight over the bus with
-        // whatever host FluidNC's own spi_init_bus() uses for those.
+        // ETH.begin()'s SPI-Ethernet overload takes raw pin numbers and adds its
+        // own ESP-IDF spi_master device, with its own CS, on the host we give it.
+        //
+        // That host is deliberately the *same* one FluidNC's spi_init_bus() uses:
+        // esp32/spi.cpp initializes HSPI_HOST, which is SPI2_HOST on both esp32
+        // (hal/esp32/include/hal/spi_types.h) and esp32s3. Sharing is what makes
+        // the W5500 coexist with SDCard on one set of physical pins, and it is
+        // safe because ETH.cpp's beginSPI() treats ESP_ERR_INVALID_STATE from its
+        // own spi_bus_initialize() as success - i.e. "already initialized, just
+        // add my device". The ordering that this relies on is guaranteed:
+        // Main.cpp calls config->_spi->init() before any Module::init(), and
+        // EthConfig is a Module (init_priority 106).
         pinnum_t sckPin  = config->_spi->_sck.getNative(Pin::Capabilities::Output | Pin::Capabilities::Native);
         pinnum_t mosiPin = config->_spi->_mosi.getNative(Pin::Capabilities::Output | Pin::Capabilities::Native);
         pinnum_t misoPin = config->_spi->_miso.getNative(Pin::Capabilities::Input | Pin::Capabilities::Native);
 
-        bool ok = ETH.begin(arduinoPhyType(_phy_type),
-                            _phy_addr,
-                            int(csPin),
-                            intPin,
-                            rstPin,
-                            SPI2_HOST,
-                            int(sckPin),
-                            int(mosiPin),
-                            int(misoPin),
-                            uint8_t(_frequency_hz / 1000000));
+        // Argument order after spi_host is (sck, miso, mosi) - see
+        // libraries/Ethernet/src/ETH.h in Arduino-ESP32 core 3.x. Passing
+        // mosi where miso is expected wires the W5500 up backwards, so the
+        // PHY never answers and ETH.begin() fails (or worse, half-works).
+        // Retry, because one attempt is not reliable at boot.
+        //
+        // The PHY keeps its own power across an ESP32 soft reset, and rst_pin is
+        // optional (commonly NO_PIN), so nothing resets the chip when the CPU
+        // restarts. If the reset landed part-way through an SPI transaction the
+        // PHY is still waiting for the rest of that command, and answers the
+        // chip-ID read out of whatever is left in its shift register - the driver
+        // reports "version mismatched, expected 0x04, got 0x00" and gives up.
+        //
+        // Retrying pushes the chip's SPI state machine back into sync. Measured on
+        // a W5500 over a marginal SPI link: boot-time init failed ten times in a
+        // row, while $EI - which calls this same function - succeeded ten times in
+        // a row moments later.
+        const int maxAttempts = 5;
+        const int retryDelayMs = 100;  // some W5500 modules want ~10ms after a reset
+
+        bool ok = false;
+        for (int attempt = 1; attempt <= maxAttempts && !ok; ++attempt) {
+            ok = ETH.begin(arduinoPhyType(_phy_type),
+                           _phy_addr,
+                           int(csPin),
+                           intPin,
+                           rstPin,
+                           SPI2_HOST,
+                           int(sckPin),
+                           int(misoPin),
+                           int(mosiPin),
+                           uint8_t(_frequency_hz / 1000000));
+            if (!ok && attempt < maxAttempts) {
+                log_debug("Ethernet PHY init attempt " << attempt << " failed, retrying");
+                delay_ms(retryDelayMs);
+            }
+        }
         if (!ok) {
-            log_error("Ethernet PHY init failed");
+            log_error("Ethernet PHY init failed after " << maxAttempts << " attempts");
             return false;
         }
         config_ok = true;
