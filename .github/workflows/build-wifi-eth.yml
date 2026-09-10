@@ -43,16 +43,21 @@ jobs:
             echo "::error::firmware.bin exceeds app partition ($SIZE > $LIMIT)"; exit 1
           fi
 
-      - name: Build LocalFS image (buildfs)
-        run: pio run -e wifi_eth -t buildfs
-
-      - name: Collect artifacts
+      # 先把韌體收進 out/ 再跑 buildfs —— buildfs 會把 firmware.bin 清掉
+      # （第一版 workflow 就是敗在這個順序）
+      - name: Stash firmware
         run: |
           mkdir -p out
           cp .pio/build/wifi_eth/firmware.bin   out/
           cp .pio/build/wifi_eth/bootloader.bin out/ || true
           cp .pio/build/wifi_eth/partitions.bin out/ || true
-          cp .pio/build/wifi_eth/littlefs.bin   out/ || true
+
+      - name: Build LocalFS image (buildfs)
+        run: pio run -e wifi_eth -t buildfs
+
+      - name: Collect artifacts
+        run: |
+          cp .pio/build/wifi_eth/littlefs.bin out/ || true
           ls -la out/
 
       - uses: actions/upload-artifact@v4
