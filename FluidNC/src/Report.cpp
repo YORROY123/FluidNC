@@ -633,6 +633,11 @@ void report_realtime_status(Channel& channel) {
     }
     size_t maxBlock = platform_max_free_block();
     msg << "|Mem:" << mem_level(maxBlock) << "," << (unsigned)maxBlock;
+    if (Machine::MachineConfig::_networkOnly) {
+        // Repeated panics: only the network sections of the config are loaded
+        // (MachineConfig::load()). Lets a WebUI explain it and offer a restart.
+        msg << "|Safe:net";
+    }
 #ifdef DEBUG_STEPPER_ISR
     msg << "|ISRs:" << Stepper::isr_count;
 #endif

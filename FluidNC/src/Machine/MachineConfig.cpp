@@ -310,7 +310,10 @@ namespace Machine {
         return line.rfind("spi:", 0) == 0 || line.rfind("ethernet:", 0) == 0;
     }
 
+    bool MachineConfig::_networkOnly = false;
+
     void MachineConfig::load_network_only(std::string_view filename) {
+        _networkOnly     = true;
         std::string yaml = "name: Safe mode (network only)\nboard: None\n";
         try {
             FileStream file(std::string { filename }, "rb", LocalFS);

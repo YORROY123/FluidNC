@@ -155,6 +155,10 @@ namespace Machine {
         static void load();
         static void load_file(std::string_view file);
         static void load_network_only(std::string_view file);
+
+        // True when load() fell back to only the spi: and ethernet: sections
+        // after repeated panics; reported as |Safe:net so a WebUI can say so.
+        static bool _networkOnly;
         static void load_yaml(std::string_view yaml_string);
 
         ~MachineConfig();

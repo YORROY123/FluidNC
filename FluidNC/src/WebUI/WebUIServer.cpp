@@ -539,8 +539,13 @@ namespace WebUI {
                     log_warn("Refusing to serve " << path << ": largest free block " << (unsigned)maxBlock
                                                   << " below $HTTP/MinFreeBlock=" << (unsigned)minFreeBlock);
                 }
-                AsyncWebServerResponse* response =
-                    request->beginResponse(503, "text/plain", "Low memory, try again\n");
+                // Kept tiny: this response is allocated at the worst possible
+                // moment. A browser that asked for the page retries by itself
+                // (meta refresh); scripts and favicon requests ignore the body.
+                static const char lowMemoryPage[] =
+                    "<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=3>"
+                    "<p>控制器記憶體不足，3 秒後自動重試。<br>Low memory, retrying in 3 s.";
+                AsyncWebServerResponse* response = request->beginResponse(503, "text/html; charset=utf-8", lowMemoryPage);
                 response->addHeader("Retry-After", "2");
                 request->send(response);
                 return true;
