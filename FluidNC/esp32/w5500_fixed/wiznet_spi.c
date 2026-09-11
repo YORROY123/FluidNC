@@ -5,6 +5,9 @@
  * Do not edit. Regenerate with firmware-patch/rst-watchdog/vendor_w5500.py.
  * The only changes applied are the identifier renames listed in that script;
  * see FluidNC/esp32/w5500_fixed/README.md for why this is vendored at all.
+ *
+ * EXCEPT: this file also carries local patches from that script's PATCHES
+ * list (spi-rx-whole-words). Each is marked "FluidNC local patch" below.
  */
 /*
  * SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
@@ -121,11 +124,18 @@ esp_err_t wiznet_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void *valu
     esp_err_t ret = ESP_OK;
     eth_spi_info_t *spi = (eth_spi_info_t *)spi_ctx;
 
+    /* FluidNC local patch (spi-rx-whole-words): clock register reads as one
+     * whole 32-bit word into rx_data. rx_data is word-aligned and lives on the
+     * caller's stack, which is DMA-capable internal RAM on this board, so
+     * spi_master needs no temporary buffer; with 8 * len bits it allocated one
+     * for every register read. The extra bytes come from the registers that
+     * follow - W5500 register reads have no side effects - and only len bytes
+     * are copied out below. */
     spi_transaction_t trans = {
         .flags = len <= 4 ? SPI_TRANS_USE_RXDATA : 0, // use direct reads for registers to prevent overwrites by 4-byte boundary writes
         .cmd = cmd,
         .addr = addr,
-        .length = 8 * len,
+        .length = 8 * (len <= 4 ? 4 : len),
         .rx_buffer = value
     };
     if (wiznet_spi_lock(spi)) {

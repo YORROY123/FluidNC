@@ -52,7 +52,8 @@ drain before stop, and [#120](https://github.com/espressif/esp-eth-drivers/issue
   `firmware-patch/rst-watchdog/vendor_w5500.py` in the ITRI project repo. **Do
   not edit them here** — change the script and re-run it, so a later upstream
   commit still produces a readable diff.
-- The script applies four identifier renames and nothing else:
+- The script applies four identifier renames, plus the one local patch
+  described under [Local patch](#local-patch-spi-rx-whole-words) below:
 
   | upstream | here | why |
   |---|---|---|
@@ -72,6 +73,53 @@ drain before stop, and [#120](https://github.com/espressif/esp-eth-drivers/issue
   `esp_eth_mac_w5500.c.obj` and `esp_eth_phy_w5500.c.obj` export exactly one
   symbol each, so link order would also work, but the renames make it
   impossible to link the stock driver by accident.
+
+## Local patch: spi-rx-whole-words
+
+Upstream (checked against esp-eth-drivers `master` on 2026-09-11) still has
+this; it is the one place we diverge beyond renames.
+
+**Symptom.** Under heap pressure the board panics with `LoadProhibited` and
+reboots; FluidNC then boots with `Skipping configuration file due to panic`,
+which leaves Ethernet off until a hard reset. Seen twice on 2026-09-11, once
+during a 500 KB upload and once during repeated downloads while a browser also
+loaded the WebUI. Both backtraces are identical:
+
+```
+emac_wiznet_task → emac_wiznet_receive → wiznet_read_buffer → wiznet_read
+→ wiznet_spi_read → spi_device_polling_transmit → setup_priv_desc
+   E spi_master: setup_dma_priv_buffer: Failed to allocate priv RX buffer
+→ uninstall_priv_desc → memcpy(rx_buffer, NULL, 1490)
+```
+
+**Cause.** ESP32 SPI DMA receives whole 32-bit words only
+(`spi_dma_ll_get_rx_alignment_require()` returns 4; the internal-memory cache
+line size on ESP32 is 0, so 4 is the whole requirement). IDF 5.5.4's
+`setup_dma_priv_buffer()` therefore allocates a temporary DMA buffer for any
+RX whose address *or length* is not a multiple of 4. Upstream already made
+`rx_buffer` DMA-capable to avoid that, but frame lengths are almost never a
+multiple of 4 (`ETH_MAX_PACKET_SIZE` is 1522), so one temporary buffer was
+allocated per received frame, and one per 1- or 2-byte register read. When the
+allocation fails, `uninstall_priv_desc()` still copies from the buffer it never
+got. That is an IDF bug ([esp-idf#11590](https://github.com/espressif/esp-idf/issues/11590)
+looks like the same report); we cannot patch the precompiled `libesp_driver_spi.a`.
+
+**Fix.** Make every RX in this driver word-sized, so the allocation never
+happens and the IDF bug is unreachable:
+
+- payload reads round the length up to a multiple of 4 into `rx_buffer`, which
+  is allocated 2 bytes larger to hold it. The extra bytes come from past the
+  frame in the chip's RX buffer; `RX_RD` is advanced by the frame length, not
+  by how much was read, so this has no effect on the chip.
+- register reads (`SPI_TRANS_USE_RXDATA`, `len <= 4`) clock a full 4 bytes into
+  `rx_data`, which is word-aligned on the caller's DMA-capable stack; only
+  `len` bytes are copied out. The extra bytes are the following registers, and
+  W5500 register reads have no side effects.
+
+No extra RAM: the only allocation that grows is `rx_buffer`, by 2 bytes, and a
+per-frame malloc/free of up to 1.5 KB goes away. Running out of heap in the RX
+path now means a dropped frame (`no mem for receive buffer`), which TCP
+retransmits, instead of a panic.
 
 ## Verified
 

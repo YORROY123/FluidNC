@@ -5,6 +5,9 @@
  * Do not edit. Regenerate with firmware-patch/rst-watchdog/vendor_w5500.py.
  * The only changes applied are the identifier renames listed in that script;
  * see FluidNC/esp32/w5500_fixed/README.md for why this is vendored at all.
+ *
+ * EXCEPT: this file also carries local patches from that script's PATCHES
+ * list (spi-rx-whole-words). Each is marked "FluidNC local patch" below.
  */
 /*
  * SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
@@ -630,6 +633,10 @@ err:
     return ret;
 }
 
+/* FluidNC local patch (spi-rx-whole-words): ESP32 SPI DMA receives whole
+ * 32-bit words only; see the payload read in emac_wiznet_receive(). */
+#define WIZNET_RX_DMA_LEN(len) (((uint32_t)(len) + 3u) & ~3u)
+
 esp_err_t emac_wiznet_receive(esp_eth_mac_t *mac, uint8_t *buf, uint32_t *length)
 {
     esp_err_t ret = ESP_OK;
@@ -669,7 +676,14 @@ esp_err_t emac_wiznet_receive(esp_eth_mac_t *mac, uint8_t *buf, uint32_t *length
     // 2 bytes of header
     offset += 2;
     // read the payload
-    ESP_GOTO_ON_ERROR(wiznet_read_buffer(emac, emac->rx_buffer, copy_len, offset), err, emac->tag, "read payload failed, len=%" PRIu16 ", offset=%" PRIu16, rx_len, offset);
+    /* FluidNC local patch (spi-rx-whole-words): read a whole number of words.
+     * rx_buffer is DMA-capable, but most frame lengths are not a multiple of
+     * 4, so spi_master allocated a temporary buffer for nearly every frame -
+     * and when that failed under heap pressure, its cleanup memcpy()d from
+     * NULL and panicked the board. The up to 3 extra bytes are read from past
+     * the frame in the chip's RX buffer, which is harmless: RX_RD is advanced
+     * by rx_len below, not by how much was read. */
+    ESP_GOTO_ON_ERROR(wiznet_read_buffer(emac, emac->rx_buffer, WIZNET_RX_DMA_LEN(copy_len), offset), err, emac->tag, "read payload failed, len=%" PRIu16 ", offset=%" PRIu16, rx_len, offset);
     memcpy(buf, emac->rx_buffer, copy_len);
     offset += rx_len;
     // update read pointer
@@ -998,7 +1012,8 @@ emac_wiznet_t *emac_wiznet_new(const eth_wiznet_config_t *wiznet_config,
     }
 
     /* allocate RX buffer */
-    emac->rx_buffer = heap_caps_malloc(ETH_MAX_PACKET_SIZE, MALLOC_CAP_DMA);
+    /* FluidNC local patch (spi-rx-whole-words): room for the word-rounded read. */
+    emac->rx_buffer = heap_caps_malloc(WIZNET_RX_DMA_LEN(ETH_MAX_PACKET_SIZE), MALLOC_CAP_DMA);
     if (!emac->rx_buffer) {
         ESP_LOGE(tag, "RX buffer allocation failed");
         goto err;
