@@ -65,6 +65,10 @@ jobs:
       - name: Collect artifacts
         run: |
           cp .pio/build/wifi_eth/littlefs.bin out/ || true
+          # firmware.elf is the only way to turn a panic backtrace into line
+          # numbers.  Without it a Guru Meditation from the field is just a
+          # list of addresses, and the build that produced them is gone.
+          cp .pio/build/wifi_eth/firmware.elf out/ || true
           ls -la out/
 
       - uses: actions/upload-artifact@v4

@@ -14,6 +14,7 @@
 #endif
 
 #include "Driver/fluidnc_mdns.h"
+#include "Driver/heap.h"  // platform_max_free_block()
 #include "NetSettings.h"
 
 #include <WiFi.h>
@@ -554,6 +555,40 @@ namespace WebUI {
                 request->send(304);
             }
             return true;
+        }
+
+        // Serving a file is by far the largest heap consumer in this firmware.
+        // Measured on an ESP32 with Ethernet: idle leaves about 25 kB free, and
+        // streaming the 123 kB gzipped WebUI bundle takes the largest free block
+        // down to a few hundred bytes. At that point an allocation fails
+        // somewhere that does not check, and the board panics and reboots.
+        //
+        // On a machine that moves, a reboot is not a degraded web page: motion
+        // stops mid-cut, machine position is lost and the job cannot resume. So
+        // refuse the request while the heap is this tight and let the browser
+        // retry. A WebUI that says "busy" is always the better outcome.
+        //
+        // The threshold is in terms of the largest contiguous block rather than
+        // total free, because that is what an allocation actually needs.
+        static constexpr size_t MIN_FREE_BLOCK_TO_SERVE = 12 * 1024;
+        static uint32_t         lastLowHeapLog          = 0;
+
+        if (size_t maxBlock = platform_max_free_block()) {
+            if (maxBlock < MIN_FREE_BLOCK_TO_SERVE) {
+                // Rate-limit the log: under load this path is hit repeatedly,
+                // and logging is itself an allocation.
+                uint32_t now = millis();
+                if (now - lastLowHeapLog > 2000) {
+                    lastLowHeapLog = now;
+                    log_warn("Refusing to serve " << path << ": largest free block " << (unsigned)maxBlock
+                                                  << " below " << (unsigned)MIN_FREE_BLOCK_TO_SERVE);
+                }
+                AsyncWebServerResponse* response =
+                    request->beginResponse(503, "text/plain", "Low memory, try again\n");
+                response->addHeader("Retry-After", "2");
+                request->send(response);
+                return true;
+            }
         }
 
         bool        isGzip = false;
