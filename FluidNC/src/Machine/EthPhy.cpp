@@ -9,6 +9,7 @@
 #    include "Assertion.h"
 
 #    include <ETH.h>
+#    include <esp_rom_sys.h>
 
 namespace Machine {
     const EnumItem EthPhy::phyTypes[] = {
@@ -40,7 +41,21 @@ namespace Machine {
 
     void EthPhy::afterParse() {}
 
-    bool EthPhy::init() {
+    void EthPhy::hardReset() {
+        if (!_rst.defined()) {
+            return;
+        }
+        _rst.setAttr(Pin::Attr::Output);
+        _rst.write(0);
+        // delay_ms() rounds down to RTOS ticks; use a timed pulse so even
+        // builds with a tick longer than 2 ms meet the W5500 minimum.
+        esp_rom_delay_us(2000);
+        _rst.write(1);
+        delay_ms(50);
+    }
+
+    bool EthPhy::init(int maxAttempts) {
+        config_ok = false;
         if (!_cs.defined()) {
             log_debug("Ethernet not configured (no cs_pin)");
             return false;
@@ -64,8 +79,15 @@ namespace Machine {
 
         int rstPin = -1;
         if (_rst.defined()) {
-            _rst.setAttr(Pin::Attr::Output);
             rstPin = _rst.getNative(Pin::Capabilities::Output | Pin::Capabilities::Native);
+            if (_phy_type == W5500) {
+                log_info("Ethernet hardware reset via " << _rst.name() << " (2 ms low, 50 ms settle)");
+                // W5500 datasheet v1.1.0 requires >=500 us low. IDF 5.5.4
+                // supplies only 100 us and no settling delay; reset it here.
+                rstPin = -1;
+            } else {
+                _rst.setAttr(Pin::Attr::Output);
+            }
         }
 
         // config->_spi holds Pin objects for the shared SPI bus (sck/mosi/miso).
@@ -102,11 +124,13 @@ namespace Machine {
         // a W5500 over a marginal SPI link: boot-time init failed ten times in a
         // row, while $EI - which calls this same function - succeeded ten times in
         // a row moments later.
-        const int maxAttempts = 5;
         const int retryDelayMs = 100;  // some W5500 modules want ~10ms after a reset
 
         bool ok = false;
         for (int attempt = 1; attempt <= maxAttempts && !ok; ++attempt) {
+            if (_phy_type == W5500) {
+                hardReset();
+            }
             ok = ETH.begin(arduinoPhyType(_phy_type),
                            _phy_addr,
                            int(csPin),

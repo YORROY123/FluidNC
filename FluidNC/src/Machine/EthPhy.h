@@ -99,7 +99,11 @@ namespace Machine {
         void afterParse() override;
 
         // Brings up the PHY via ETH.begin(). Returns true on success.
-        bool init();
+        // maxAttempts is the number of ETH.begin() tries; the boot path uses
+        // the default, while EthConfig's runtime watchdog passes 1 so its own
+        // state machine owns the retry spacing.
+        bool init(int maxAttempts = 5);
+        void hardReset();
 
         ~EthPhy() = default;
     };

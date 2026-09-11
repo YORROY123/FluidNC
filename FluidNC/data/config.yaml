@@ -1,5 +1,5 @@
 board: Wemos_CNCshield
-name: itrinc
+name: "ITRI NC"
 meta: 4axis_OLED_21_22
 stepping: 
   engine: RMT
@@ -9,11 +9,6 @@ stepping:
   disable_delay_us: 0
   segments: 12
 
-i2c0: 
-  sda_pin: gpio.21
-  scl_pin: gpio.22
-  frequency: 100000
-
 spi: 
   miso_pin: gpio.19
   mosi_pin: gpio.23
@@ -22,10 +17,10 @@ spi:
 ethernet:
   cs_pin: gpio.5
   int_pin: NO_PIN
-  rst_pin: NO_PIN
+  rst_pin: gpio.22
   phy_type: w5500
   phy_addr: 1
-  frequency_hz: 1000000
+  frequency_hz: 10000000
 
 
 kinematics: 
@@ -225,14 +220,6 @@ user_outputs:
   digital5_pin: NO_PIN
   digital6_pin: NO_PIN
   digital7_pin: NO_PIN
-
-oled: 
-  report_interval_ms: 500
-  i2c_num: 0
-  i2c_address: 60
-  width: 128
-  height: 64
-  radio_delay_ms: 500
 
 PWM: 
   pwm_hz: 5000
