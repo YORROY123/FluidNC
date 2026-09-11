@@ -20,6 +20,12 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Test Ethernet deadline ownership and framework patch
+        run: |
+          g++ -std=c++17 -pthread -IFluidNC/src/WebUI fixture_tests/eth_single_flight_test.cpp -o /tmp/eth-single-flight-test
+          /tmp/eth-single-flight-test
+          python tools/bound_eth_stop.py
+
       - name: Cache PlatformIO packages
         uses: actions/cache@v4
         with:

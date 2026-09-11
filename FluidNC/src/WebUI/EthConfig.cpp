@@ -25,6 +25,7 @@
 #    include "Main.h"
 #    include "System.h"
 #    include <atomic>
+#    include "EthSingleFlight.h"
 
 #    include "WebUIServer.h"
 #    include "TelnetServer.h"
@@ -70,9 +71,9 @@ namespace WebUI {
     // 0xFF is valid at 100M/full duplex; floating MISO requires data-path
     // detection. ARP recovery is armed only after seeing the gateway since
     // the last start, so a powered-off gateway causes at most one restart.
-    // Recovery runs in the polling task, only outside motion. A failed begin
-    // can take about 2 s; the stepper preparation task is separate, but polling
-    // of realtime characters is delayed during these driver calls.
+    // Runtime driver calls run in one dedicated worker. The polling task
+    // only submits work and reports deadlines; a late worker retains ownership
+    // until it returns. No task deletion, overlapping retries, or MCU resets.
     // ------------------------------------------------------------------
 
     enum class EthRecovery : uint8_t {
@@ -95,6 +96,14 @@ namespace WebUI {
         ~DriverGuard() { if (_locked) _driverBusy.clear(std::memory_order_release); }
         explicit operator bool() const { return _locked; }
     };
+    static EthSingleFlight _flight;
+    static TaskHandle_t _worker = nullptr;
+    static std::atomic<bool> _shutdown { false };
+    static constexpr uint32_t WORK_DEADLINE_MS = 15000;
+    static std::atomic<const char*> _stage { "idle" };
+    static std::atomic<const char*> _manualResult { "none" };
+    static uint32_t _lastDispatchMs = 0;
+    static bool _deadlineReported = false;
     static bool _gatewaySeen = false;
     static bool _logProbe = true;
 
@@ -218,6 +227,12 @@ namespace WebUI {
         }
 
         static void reportStatus(Channel& out) {
+            log_stream(out, "Ethernet last manual init: " << _manualResult.load());
+            if (_flight.busy()) {
+                log_stream(out, "Ethernet worker: " << (_flight.timedOut(millis(), WORK_DEADLINE_MS) ? "timed out" : "busy")
+                                                   << " (" << _stage.load() << ")");
+                return;  // never query the driver/netif during a blocked operation
+            }
             DriverGuard guard;
             if (!guard) {
                 log_string(out, "Ethernet: driver busy; retry status shortly");
@@ -265,6 +280,11 @@ namespace WebUI {
         void status_report(Channel& out) override { reportStatus(out); }
 
         void wifi_stats(JSONencoder& j) override {
+            DriverGuard guard;
+            if (!guard || _flight.busy()) {
+                j.id_value_object("Current Network Mode", "Ethernet worker busy; use serial status");
+                return;
+            }
             if (!isOn()) {
                 j.id_value_object("Current Network Mode", "Ethernet Off");
                 return;
@@ -300,8 +320,21 @@ namespace WebUI {
         static Error initEth(const char* parameter, AuthenticationLevel auth_level, Channel& out) {
             (void)parameter;
             (void)auth_level;
+            if (!config->_ethernet || !_worker || _shutdown.load()) return Error::InvalidStatement;
+            if (inMotionState()) return Error::IdleError;
+            if (!_flight.submit(true, millis())) {
+                log_stream(out, "Ethernet worker busy; no overlapping restart was queued");
+                return Error::InvalidStatement;
+            }
+            _manualResult = "queued";
+            xTaskNotifyGive(_worker);
+            log_stream(out, "Ethernet init queued; check $Ethernet/Status for completion");
+            return Error::Ok;  // acknowledges the request, not successful initialization
+        }
+
+        static Error manualInit() {
             if (!config->_ethernet) {
-                log_stream(out, "Ethernet is not configured (no ethernet: section)");
+                log_info("Ethernet is not configured (no ethernet: section)");
                 return Error::InvalidStatement;
             }
 
@@ -310,16 +343,17 @@ namespace WebUI {
             }
             DriverGuard guard;
             if (!guard) {
-                log_stream(out, "Ethernet recovery busy; retry $EI shortly");
+                log_info("Ethernet recovery busy; retry $EI shortly");
                 return Error::InvalidStatement;
             }
+            _stage = "manual init";
             _rstate = EthRecovery::Off;
 
             // ETH.begin() against a live handle is a phantom success ("ETH
             // Already Started"), and EthPhy::init()'s cs_pin setAttr() can
             // yank CS away from a healthy driver, so always stop first.
             if (ETH.handle() != NULL) {
-                log_stream(out, "Stopping existing Ethernet driver...");
+                log_info("Stopping existing Ethernet driver...");
                 config->_ethernet->config_ok = false;
                 stopDriver();
                 if (ETH.handle() != NULL && hasHardwareReset()) {
@@ -328,20 +362,20 @@ namespace WebUI {
                 if (ETH.handle() != NULL) {
                     // esp_eth_stop() failed; the driver FSM is stuck and a
                     // second stop would just return ESP_ERR_INVALID_STATE.
-                    log_stream(out, "Failed to stop Ethernet driver; hardware recovery pending, or reboot with $Bye");
+                    log_info("Failed to stop Ethernet driver; hardware recovery pending, or reboot with $Bye");
                     _nextActionMs = millis() + 5000;
                     _rstate = EthRecovery::Jammed;
                     return Error::InvalidStatement;
                 }
             }
 
-            log_stream(out, "Initializing Ethernet PHY...");
+            log_info("Initializing Ethernet PHY...");
             bool ethActive = networkType() == NetworkTypeEthernet;
             // When Ethernet is the active network type do the full bring-up
-            // (hostname, static IP, link/DHCP wait); otherwise just the PHY,
+            // (hostname and static IP); otherwise just the PHY,
             // preserving the logic-analyzer use case under WiFi mode.
-            bool ok = ethActive ? StartEth(true) : config->_ethernet->init();
-            log_stream(out, "Ethernet PHY init " << (ok ? "succeeded" : "failed"));
+            bool ok = ethActive ? StartEth(false) : config->_ethernet->init(1);
+            log_info("Ethernet PHY init " << (ok ? "succeeded" : "failed"));
 
             if (ethActive && config->_ethernet->_phy_type == Machine::EthPhy::W5500) {
                 if (ok) {
@@ -363,12 +397,31 @@ namespace WebUI {
             return ok ? Error::Ok : Error::InvalidStatement;
         }
 
+        static void workerLoop(void*) {
+            for (;;) {
+                ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+                bool manual = false;
+                if (!_flight.take(manual)) continue;
+                if (!_shutdown.load()) {
+                    if (manual) {
+                        Error result = manualInit();
+                        _manualResult = result == Error::Ok ? "succeeded" : result == Error::IdleError ? "rejected: motion started" : "failed";
+                    } else {
+                        recoveryPass();
+                    }
+                }
+                _stage = "idle";
+                _flight.complete();
+            }
+        }
+
         static bool hasHardwareReset() {
             return config->_ethernet && config->_ethernet->_phy_type == Machine::EthPhy::W5500
                 && config->_ethernet->_rst.defined();
         }
 
         static void stopDriver() {
+            _stage = "stop/reset";
             if (hasHardwareReset()) {
                 config->_ethernet->hardReset();
             }
@@ -376,6 +429,7 @@ namespace WebUI {
         }
 
         static void unjamDriver() {
+            _stage = "jam recovery";
             if (ETH.handle() == nullptr || !hasHardwareReset()) return;
             config->_ethernet->hardReset();
             // A failed stop has already moved the IDF FSM to STOP. Starting
@@ -387,12 +441,13 @@ namespace WebUI {
             ETH.end();
         }
 
-        // block == true is the boot/$EI path: retry ETH.begin() internally
+        // block == true is the boot path: retry ETH.begin() internally
         // and wait for link/DHCP. block == false is the watchdog's recovery
         // path: single begin attempt (the watchdog state machine owns retry
         // spacing) and no waiting -- link and DHCP complete asynchronously,
         // exactly as after a cable replug.
         static bool StartEth(bool block = true) {
+            _stage = "begin/configure";
             if (!config->_ethernet) {
                 log_info("Ethernet is not configured (no ethernet: section)");
                 return false;
@@ -423,6 +478,7 @@ namespace WebUI {
             }
 
             if (block) {
+                _stage = "link/IP wait";
                 // Wait briefly for link up / DHCP lease, mirroring WifiConfig::ConnectSTA2AP
                 // but without WiFi's association-retry complexity -- a wired link either
                 // comes up quickly or it's not plugged in.
@@ -463,6 +519,11 @@ namespace WebUI {
             new WebCommand("IP=ipaddress MSK=netmask GW=gateway", WEBCMD, WA, NULL, "Ethernet/Setup", showSetEthParams);
             new WebCommand(NULL, WEBCMD, WA, "EI", "Ethernet/Init", initEth, anyState);
 
+            if (config->_ethernet && xTaskCreatePinnedToCore(workerLoop, "eth_recovery", 8192, nullptr, 1,
+                                                            &_worker, SUPPORT_TASK_CORE) != pdPASS) {
+                _worker = nullptr;
+                log_error("Ethernet recovery worker creation failed");
+            }
             if (networkType() != NetworkTypeEthernet) {
                 log_info("Ethernet is disabled ($network/type is WiFi)");
                 return;
@@ -493,28 +554,44 @@ namespace WebUI {
         }
 
         void deinit() override {
+            _shutdown = true;
             _rstate = EthRecovery::Off;
-            // Module shutdown must finish after any in-flight watchdog pass.
-            while (_driverBusy.test_and_set(std::memory_order_acquire)) delay_ms(10);
-            _rstate = EthRecovery::Off;
-            if (ETH.handle() != nullptr) stopDriver();
-            _driverBusy.clear(std::memory_order_release);
+            // Never wait for or delete a worker that may own driver resources.
+            DriverGuard guard;
+            if (guard && !_flight.busy() && ETH.handle() == nullptr) _stage = "off";
+            // Hardware cleanup is intentionally deferred to reset if a driver
+            // remains installed. FluidNC does not currently call module deinit.
         }
 
-        // Watchdog state machine; see the block comment above EthRecovery.
-        // Called continuously from the protocol main loop. Slow driver calls run only during recovery outside motion;
-        // when healthy the cost is one SPI register read per 3 s and one
-        // ARP lookup per 20 s.
         void poll() override {
-            DriverGuard guard;
-            if (!guard || _rstate == EthRecovery::Off) {
+            if (_shutdown.load() || !_worker) return;
+            uint32_t now = millis();
+            if (_flight.busy()) {
+                if (!_deadlineReported && _flight.timedOut(now, WORK_DEADLINE_MS)) {
+                    _deadlineReported = true;
+                    log_error("Ethernet worker deadline exceeded at " << _stage.load()
+                              << "; retaining driver ownership until it returns");
+                }
                 return;
             }
+            if (_deadlineReported) {
+                log_warn("Ethernet worker returned after deadline; recovery may continue");
+                _deadlineReported = false;
+            }
+            if (_rstate == EthRecovery::Off || now - _lastDispatchMs < 100) return;
+            _lastDispatchMs = now;
+            if (_flight.submit(false, now)) xTaskNotifyGive(_worker);
+        }
+
+        static void recoveryPass() {
+            DriverGuard guard;
+            if (!guard || _rstate == EthRecovery::Off) return;
             uint32_t now = millis();
             switch (_rstate.load()) {
                 case EthRecovery::Monitor:
                     if (now - _lastProbeMs >= PROBE_PERIOD_MS) {
                         _lastProbeMs = now;
+                        _stage = "PHY probe";
                         if (probeOk()) {
                             _badProbes = 0;
                             if (_failedRounds && now - _recoveredMs >= HEALTHY_RESET_MS) {
@@ -527,6 +604,7 @@ namespace WebUI {
                     }
                     if (now - _lastArpMs >= ARP_PERIOD_MS) {
                         _lastArpMs = now;
+                        _stage = "ARP/core lock";
                         if (arpAlive()) {
                             _arpMisses = 0;
                         } else if (++_arpMisses >= ARP_DEAD_COUNT) {
