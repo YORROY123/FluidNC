@@ -25,6 +25,15 @@ namespace WebUI {
     static const int DEFAULT_HTTP_BLOCKED_DURING_MOTION = 1;
     static const int DEFAULT_HTTP_PORT                  = 80;
 
+    // Refuse to stream a file when the largest free heap block is below this.
+    // Measured rather than reasoned: streaming the WebUI bundle took the
+    // largest block from about 25 kB down to a few hundred bytes, and the board
+    // panicked when an allocation lost that race. A fresh boot leaves anywhere
+    // from 14 kB to 25 kB depending on how allocation lands, so this is a
+    // starting point rather than a number to trust - tune it on the machine
+    // with $HTTP/MinFreeBlock. 0 disables the check.
+    static const int DEFAULT_HTTP_MIN_FREE_BLOCK = 10240;
+
     static const int MIN_HTTP_PORT = 1;
     static const int MAX_HTTP_PORT = 65001;
 

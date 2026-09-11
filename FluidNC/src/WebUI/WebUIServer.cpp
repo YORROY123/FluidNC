@@ -280,6 +280,7 @@ namespace WebUI {
     std::string WebUI_Server::_uploadPath = "";  // Store upload directory path for listing
 
     EnumSetting *http_enable, *http_block_during_motion;
+    IntSetting*  http_min_free_block;
     IntSetting*  http_port;
 
     WebUI_Server::~WebUI_Server() {
@@ -289,6 +290,21 @@ namespace WebUI {
     void WebUI_Server::init() {
         http_port   = new IntSetting("HTTP Port", WEBSET, WA, "ESP121", "HTTP/Port", DEFAULT_HTTP_PORT, MIN_HTTP_PORT, MAX_HTTP_PORT);
         http_enable = new EnumSetting("HTTP Enable", WEBSET, WA, "ESP120", "HTTP/Enable", DEFAULT_HTTP_STATE, &onoffOptions);
+        // Refuse to stream a file when the largest free block is below this.
+        // Tunable at runtime because the right value is not knowable at build
+        // time: measured on one ESP32 with Ethernet, a fresh boot left a
+        // largest block anywhere between 14 kB and 25 kB depending on how
+        // allocation happened to land, so a compiled-in constant is either too
+        // close to the floor on a bad boot or too loose to help on a good one.
+        // 0 disables the check.
+        http_min_free_block = new IntSetting("Minimum free heap block to serve files",
+                                             WEBSET,
+                                             WA,
+                                             NULL,
+                                             "HTTP/MinFreeBlock",
+                                             DEFAULT_HTTP_MIN_FREE_BLOCK,
+                                             0,
+                                             131072);
         http_block_during_motion = new EnumSetting("Block serving HTTP content during motion",
                                                    WEBSET,
                                                    WA,
@@ -570,18 +586,18 @@ namespace WebUI {
         //
         // The threshold is in terms of the largest contiguous block rather than
         // total free, because that is what an allocation actually needs.
-        static constexpr size_t MIN_FREE_BLOCK_TO_SERVE = 12 * 1024;
-        static uint32_t         lastLowHeapLog          = 0;
+        static uint32_t lastLowHeapLog = 0;
 
-        if (size_t maxBlock = platform_max_free_block()) {
-            if (maxBlock < MIN_FREE_BLOCK_TO_SERVE) {
+        const size_t minFreeBlock = size_t(http_min_free_block->get());
+        if (size_t maxBlock = minFreeBlock ? platform_max_free_block() : 0) {
+            if (maxBlock < minFreeBlock) {
                 // Rate-limit the log: under load this path is hit repeatedly,
                 // and logging is itself an allocation.
                 uint32_t now = millis();
                 if (now - lastLowHeapLog > 2000) {
                     lastLowHeapLog = now;
                     log_warn("Refusing to serve " << path << ": largest free block " << (unsigned)maxBlock
-                                                  << " below " << (unsigned)MIN_FREE_BLOCK_TO_SERVE);
+                                                  << " below $HTTP/MinFreeBlock=" << (unsigned)minFreeBlock);
                 }
                 AsyncWebServerResponse* response =
                     request->beginResponse(503, "text/plain", "Low memory, try again\n");
