@@ -25,6 +25,7 @@ jobs:
           g++ -std=c++17 -pthread -IFluidNC/src/WebUI fixture_tests/eth_single_flight_test.cpp -o /tmp/eth-single-flight-test
           /tmp/eth-single-flight-test
           python tools/bound_eth_stop.py
+          python tools/install_w5500_fixed.py
 
       - name: Cache PlatformIO packages
         uses: actions/cache@v4
