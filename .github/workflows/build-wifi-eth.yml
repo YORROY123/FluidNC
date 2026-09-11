@@ -58,6 +58,10 @@ jobs:
           cp .pio/build/wifi_eth/firmware.bin   out/
           cp .pio/build/wifi_eth/bootloader.bin out/ || true
           cp .pio/build/wifi_eth/partitions.bin out/ || true
+          # firmware.elf has to be stashed here for the same reason as
+          # firmware.bin: buildfs wipes it.  Without it a Guru Meditation from
+          # the field is a list of addresses with no way back to a line number.
+          cp .pio/build/wifi_eth/firmware.elf   out/ || true
 
       - name: Build LocalFS image (buildfs)
         run: pio run -e wifi_eth -t buildfs
@@ -65,10 +69,7 @@ jobs:
       - name: Collect artifacts
         run: |
           cp .pio/build/wifi_eth/littlefs.bin out/ || true
-          # firmware.elf is the only way to turn a panic backtrace into line
-          # numbers.  Without it a Guru Meditation from the field is just a
-          # list of addresses, and the build that produced them is gone.
-          cp .pio/build/wifi_eth/firmware.elf out/ || true
+          test -f out/firmware.elf || { echo "::error::firmware.elf missing from out/"; exit 1; }
           ls -la out/
 
       - uses: actions/upload-artifact@v4
