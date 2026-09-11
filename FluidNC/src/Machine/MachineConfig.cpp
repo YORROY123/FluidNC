@@ -251,30 +251,94 @@ namespace Machine {
 
     const char defaultConfig[] = "name: Default (Test Drive)\nboard: None\n";
 
-    void MachineConfig::load() {
-        // If the system crashes we skip the config file and use the default
-        // builtin config.  This helps prevent reset loops on bad config files.
-        if (restart_was_panic()) {
-            log_error("Skipping configuration file due to panic");
-            backtrace_t bt;
-            if (backtrace_get(&bt)) {
-                char buf[16];
-                snprintf(buf, sizeof(buf), "0x%08x", bt.pc);
-                log_error("Previous crash backtrace (PC=" << buf << " cause=" << bt.exccause << "):");
-                std::string btLine = "Backtrace:";
-                for (size_t i = 0; i < bt.num_addresses; i++) {
-                    snprintf(buf, sizeof(buf), " 0x%08x", bt.addresses[i]);
-                    btLine += buf;
-                    btLine += ":0x00000000";
-                }
-                log_error(btLine.c_str());
+    // How much of the config file to trust after panic restarts, by how many
+    // came in a row (restart_panic_streak(); a minute of uptime ends a streak).
+    // Skipping the file guards against a config that crashes the board on every
+    // boot, but it also skips the ethernet: section, and a machine reached only
+    // over Ethernet then needs someone to walk over and power-cycle it. So:
+    //
+    //   1          load all of it. A one-off crash is far more likely than a
+    //              config that crashes.
+    //   2 .. 3     load only the sections that bring the network up (spi,
+    //              ethernet), so the file can be fixed remotely, and nothing
+    //              that drives motors, spindle or I/O. Stays in ConfigAlarm.
+    //   4 and up   load none of it: built-in default, serial only. By now the
+    //              network sections themselves may be what crashes.
+    static constexpr uint32_t kNetworkOnlyStreak = 2;
+    static constexpr uint32_t kDefaultOnlyStreak = 4;
+
+    static void log_previous_crash(uint32_t streak) {
+        if (streak == UINT32_MAX) {
+            log_error("Restarted after a panic");
+        } else {
+            log_error("Restarted after a panic (" << streak << " in a row)");
+        }
+        backtrace_t bt;
+        if (backtrace_get(&bt)) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "0x%08x", bt.pc);
+            log_error("Previous crash backtrace (PC=" << buf << " cause=" << bt.exccause << "):");
+            std::string btLine = "Backtrace:";
+            for (size_t i = 0; i < bt.num_addresses; i++) {
+                snprintf(buf, sizeof(buf), " 0x%08x", bt.addresses[i]);
+                btLine += buf;
+                btLine += ":0x00000000";
             }
+            log_error(btLine.c_str());
+        }
+    }
+
+    void MachineConfig::load() {
+        uint32_t streak = restart_panic_streak();
+        if (streak) {
+            log_previous_crash(streak);
+        }
+        if (streak >= kDefaultOnlyStreak) {
+            log_error("Skipping configuration file due to panic");
             log_info("Using default configuration");
             load_yaml(defaultConfig);
             set_state(State::ConfigAlarm);
+        } else if (streak >= kNetworkOnlyStreak) {
+            load_network_only(config_filename->get());
         } else {
             load_file(config_filename->get());
         }
+    }
+
+    // Top-level YAML keys start in column 0; a section runs until the next one.
+    static bool is_network_section(std::string_view line) {
+        return line.rfind("spi:", 0) == 0 || line.rfind("ethernet:", 0) == 0;
+    }
+
+    void MachineConfig::load_network_only(std::string_view filename) {
+        std::string yaml = "name: Safe mode (network only)\nboard: None\n";
+        try {
+            FileStream file(std::string { filename }, "rb", LocalFS);
+            auto       filesize = file.size();
+            auto       buffer   = std::make_unique<char[]>(filesize + 1);
+            if (filesize > 0 && size_t(file.read(buffer.get(), filesize)) == filesize) {
+                std::string_view text { buffer.get(), filesize };
+                bool             keep = false;
+                while (!text.empty()) {
+                    size_t           eol  = text.find('\n');
+                    std::string_view line = text.substr(0, eol == std::string_view::npos ? text.size() : eol + 1);
+                    text.remove_prefix(line.size());
+                    char c = line[0];
+                    if (c != ' ' && c != '\t' && c != '\r' && c != '\n' && c != '#') {
+                        keep = is_network_section(line);
+                    }
+                    if (keep) {
+                        yaml.append(line);
+                    }
+                }
+            }
+        } catch (...) {
+            // Unreadable file: fall through with no sections, same as the default config.
+        }
+        log_error("Repeated panics: loading only the spi: and ethernet: sections of " << filename);
+        log_info("Motors, spindle and I/O are not configured. Fix the config, then restart with $Bye");
+        load_yaml(yaml);
+        set_state(State::ConfigAlarm);
     }
 
     void MachineConfig::load_file(const std::string_view filename) {

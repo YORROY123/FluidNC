@@ -562,6 +562,15 @@ static void protocol_do_start() {
         send_alarm(ExecAlarm::Init);
         return;
     }
+    if (restart_panic_streak()) {
+        // After a crash the config is loaded again so the network comes back
+        // by itself (see MachineConfig::load()), but machine position is gone
+        // and a job may have been cut off mid-move. Nothing moves until someone
+        // has acknowledged with $X or homed.
+        Homing::set_all_axes_unhomed();
+        send_alarm(ExecAlarm::Init);
+        return;
+    }
     Homing::set_all_axes_unhomed();
     if (Homing::unhomed_axes()) {
         // If there is an axis with homing configured, enter Alarm state on startup

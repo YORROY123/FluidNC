@@ -27,3 +27,7 @@ void restart() {
 bool restart_was_panic() {
     return false;
 }
+
+uint32_t restart_panic_streak() {
+    return 0;
+}

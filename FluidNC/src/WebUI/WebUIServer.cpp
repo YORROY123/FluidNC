@@ -511,6 +511,42 @@ namespace WebUI {
     }
     // Send a file, either the specified path or path.gz
     bool WebUI_Server::myStreamFile(AsyncWebServerRequest* request, const char* path, bool download, bool setSession) {
+        // Serving a file is the largest heap consumer in this firmware: streaming
+        // the 123 kB gzipped WebUI bundle takes the largest free block from about
+        // 25 kB down to a few hundred bytes. On a machine that moves, running out
+        // is not a degraded web page - the board aborts, motion stops mid-cut and
+        // position is lost - so refuse the request while the heap is this tight
+        // and let the browser retry. The threshold is the largest contiguous
+        // block, because that is what an allocation actually needs.
+        //
+        // This has to come first, before anything else here allocates. It used
+        // to sit after the path object and the HashFS cache lookup, which both
+        // copy strings; under a 3-connection soak on 2026-09-11 one of those
+        // copies failed, the std::bad_alloc could not itself be allocated, and
+        // the board abort()ed - while every request was already headed for a
+        // 503. The cost is that a cache revalidation (304) is refused too while
+        // the heap is low.
+        static uint32_t lastLowHeapLog = 0;
+
+        const size_t minFreeBlock = size_t(http_min_free_block->get());
+        if (size_t maxBlock = minFreeBlock ? platform_max_free_block() : 0) {
+            if (maxBlock < minFreeBlock) {
+                // Rate-limit the log: under load this path is hit repeatedly,
+                // and logging is itself an allocation.
+                uint32_t now = millis();
+                if (now - lastLowHeapLog > 2000) {
+                    lastLowHeapLog = now;
+                    log_warn("Refusing to serve " << path << ": largest free block " << (unsigned)maxBlock
+                                                  << " below $HTTP/MinFreeBlock=" << (unsigned)minFreeBlock);
+                }
+                AsyncWebServerResponse* response =
+                    request->beginResponse(503, "text/plain", "Low memory, try again\n");
+                response->addHeader("Retry-After", "2");
+                request->send(response);
+                return true;
+            }
+        }
+
         std::error_code ec;
         FluidPath       fpath { path, LocalFS, ec };
         if (ec) {
@@ -572,40 +608,6 @@ namespace WebUI {
                 request->send(304);
             }
             return true;
-        }
-
-        // Serving a file is by far the largest heap consumer in this firmware.
-        // Measured on an ESP32 with Ethernet: idle leaves about 25 kB free, and
-        // streaming the 123 kB gzipped WebUI bundle takes the largest free block
-        // down to a few hundred bytes. At that point an allocation fails
-        // somewhere that does not check, and the board panics and reboots.
-        //
-        // On a machine that moves, a reboot is not a degraded web page: motion
-        // stops mid-cut, machine position is lost and the job cannot resume. So
-        // refuse the request while the heap is this tight and let the browser
-        // retry. A WebUI that says "busy" is always the better outcome.
-        //
-        // The threshold is in terms of the largest contiguous block rather than
-        // total free, because that is what an allocation actually needs.
-        static uint32_t lastLowHeapLog = 0;
-
-        const size_t minFreeBlock = size_t(http_min_free_block->get());
-        if (size_t maxBlock = minFreeBlock ? platform_max_free_block() : 0) {
-            if (maxBlock < minFreeBlock) {
-                // Rate-limit the log: under load this path is hit repeatedly,
-                // and logging is itself an allocation.
-                uint32_t now = millis();
-                if (now - lastLowHeapLog > 2000) {
-                    lastLowHeapLog = now;
-                    log_warn("Refusing to serve " << path << ": largest free block " << (unsigned)maxBlock
-                                                  << " below $HTTP/MinFreeBlock=" << (unsigned)minFreeBlock);
-                }
-                AsyncWebServerResponse* response =
-                    request->beginResponse(503, "text/plain", "Low memory, try again\n");
-                response->addHeader("Retry-After", "2");
-                request->send(response);
-                return true;
-            }
         }
 
         bool        isGzip = false;

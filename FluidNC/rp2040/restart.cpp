@@ -69,6 +69,12 @@ bool restart_was_panic() {
     return _panic_seen;
 }
 
+uint32_t restart_panic_streak() {
+    // Streaks are not counted here; report any panic as a long one so the
+    // config loader keeps skipping the file, as it always has on this platform.
+    return restart_was_panic() ? UINT32_MAX : 0;
+}
+
 extern "C" bool rp2040_get_last_panic_backtrace(backtrace_t* bt) {
     load_panic_info();
     log_panic_context_once();

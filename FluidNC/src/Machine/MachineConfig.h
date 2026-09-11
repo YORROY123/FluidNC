@@ -154,6 +154,7 @@ namespace Machine {
 
         static void load();
         static void load_file(std::string_view file);
+        static void load_network_only(std::string_view file);
         static void load_yaml(std::string_view yaml_string);
 
         ~MachineConfig();
