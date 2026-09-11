@@ -15,6 +15,7 @@
 
 #include "Driver/fluidnc_mdns.h"
 #include "Driver/heap.h"  // platform_max_free_block()
+#include <ESPAsyncWebServer.h>  // RESPONSE_TRY_AGAIN
 #include "NetSettings.h"
 
 #include <WiFi.h>
@@ -625,22 +626,66 @@ namespace WebUI {
             return false;
         }
 
+        // The two ways FileStream::read() can fail to hand back data mean opposite
+        // things, and the response callback has to answer each with the opposite
+        // value again:
+        //
+        //   0  is a short read, not an error - fread() simply returned nothing
+        //      this time and there is still file left. Passing 0 on tells
+        //      ESPAsyncWebServer the body is finished, and it ends the response
+        //      before Content-Length is satisfied. That is where downloads were
+        //      losing their last couple of kB.
+        //  -1  is a real error. Returning it converts to 0xFFFFFFFF, which is
+        //      exactly RESPONSE_TRY_AGAIN, so a genuine failure retried forever
+        //      instead of being reported.
+        //
+        // So short reads return RESPONSE_TRY_AGAIN and errors end the body. The
+        // old comment here said RESPONSE_TRY_AGAIN "only works for
+        // ChunkedResponse"; WebResponses.cpp handles it in the non-chunked
+        // branch too, which is the branch a known Content-Length takes.
+        //
+        // Retries are capped so a filesystem that stops yielding data ends the
+        // transfer instead of holding the connection open indefinitely - a
+        // truncated download is bad, a hung one is worse.
+        static constexpr unsigned MAX_EMPTY_READS = 64;
+        unsigned                  emptyReads     = 0;
+
         AsyncWebServerResponse* response = request->beginResponse(
-            getContentType(path), file->size(), [file, request](uint8_t* buffer, size_t maxLen, size_t total) mutable -> size_t {
+            getContentType(path),
+            file->size(),
+            [file, request, emptyReads](uint8_t* buffer, size_t maxLen, size_t total) mutable -> size_t {
                 if (!file) {
-                    request->client()->close();
-                    return 0;  //RESPONSE_TRY_AGAIN; // This only works for ChunkedResponse
+                    // Already finished or aborted. Return 0 rather than closing
+                    // the client: the library ends the response itself once
+                    // Content-Length is met, and forcing the socket shut here
+                    // can drop bytes still sitting in the send buffer.
+                    return 0;
                 }
                 if (total >= file->size() || request->method() != HTTP_GET) {
                     file = nullptr;
                     return 0;
                 }
                 size_t bytes  = min(file->size() - total, maxLen);
-                int    actual = file->read(buffer, bytes);  // return 0 even when no bytes were loaded
-                if (actual == 0 || (actual + total) >= file->size()) {
+                int    actual = file->read(buffer, bytes);
+                if (actual < 0) {
+                    log_error("Read error streaming " << request->url().c_str() << " at offset " << total);
+                    file = nullptr;
+                    return 0;
+                }
+                if (actual == 0) {
+                    if (++emptyReads > MAX_EMPTY_READS) {
+                        log_error("Giving up streaming " << request->url().c_str() << " at offset " << total
+                                                         << ": no data after " << MAX_EMPTY_READS << " attempts");
+                        file = nullptr;
+                        return 0;
+                    }
+                    return RESPONSE_TRY_AGAIN;
+                }
+                emptyReads = 0;
+                if (size_t(actual) + total >= file->size()) {
                     file = nullptr;
                 }
-                return actual;  // Return actual bytes read, not requested bytes
+                return size_t(actual);
             });
 
         request->onDisconnect([request, file]() { delete file; });
