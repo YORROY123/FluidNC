@@ -51,6 +51,11 @@ extern Counter report_wco_counter;
 void notify(const char* title, const char* msg);
 void notifyf(const char* title, const char* format, ...);
 
+// Largest free heap block below which files are refused; grades |Mem: in
+// status reports. Weak default in Report.cpp, $HTTP/MinFreeBlock when the web
+// server is built in.
+size_t mem_refuse_threshold();
+
 // Prints miscellaneous feedback messages.
 void report_feedback_message(Message message);
 void report_error_message(Message message);

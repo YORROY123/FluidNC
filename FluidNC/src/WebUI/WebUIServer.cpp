@@ -1737,3 +1737,9 @@ namespace WebUI {
 
     ModuleFactory::InstanceBuilder<WebUI_Server> __attribute__((init_priority(108))) webui_server_module("webuiserver", true);
 }
+
+// Grades the |Mem: field of status reports (Report.cpp) against the same
+// threshold myStreamFile() refuses at, so a red light means exactly that.
+size_t mem_refuse_threshold() {
+    return WebUI::http_min_free_block ? size_t(WebUI::http_min_free_block->get()) : 10240;
+}

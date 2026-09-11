@@ -26,6 +26,7 @@
 #include "WebUI/NotificationsService.h"  // WebUI::notificationsService
 #include "InputFile.h"
 #include "Job.h"
+#include "Driver/heap.h"  // platform_max_free_block
 
 #include <map>
 #include <freertos/task.h>
@@ -36,6 +37,30 @@
 volatile bool protocol_pin_changed = false;
 
 std::string report_pin_string;
+
+// |Mem: in status reports grades the largest free heap block against the
+// threshold below which the web server refuses to send files
+// ($HTTP/MinFreeBlock, overridden in WebUIServer.cpp): R means it is refusing
+// now, Y that it is within a quarter of that, G that there is room. It lets a
+// WebUI warn the operator before requests start failing. Senders that follow
+// the Grbl 1.1 report format ignore fields they do not know.
+size_t WEAK_LINK mem_refuse_threshold() {
+    return 10240;
+}
+
+static const char* mem_level(size_t maxBlock) {
+    size_t refuse = mem_refuse_threshold();
+    if (refuse == 0) {
+        refuse = 10240;  // guard disabled: still grade against its default
+    }
+    if (maxBlock < refuse) {
+        return "R";
+    }
+    if (maxBlock < refuse + refuse / 4) {
+        return "Y";
+    }
+    return "G";
+}
 
 void notifyf(const char* title, const char* format, ...) {
     char    loc_buf[64];
@@ -606,6 +631,8 @@ void report_realtime_status(Channel& channel) {
     if (Channel* jc = Job::channel()) {
         msg << "|" << jc->_progress;
     }
+    size_t maxBlock = platform_max_free_block();
+    msg << "|Mem:" << mem_level(maxBlock) << "," << (unsigned)maxBlock;
 #ifdef DEBUG_STEPPER_ISR
     msg << "|ISRs:" << Stepper::isr_count;
 #endif
